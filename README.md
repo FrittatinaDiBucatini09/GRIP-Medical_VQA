@@ -42,6 +42,7 @@
   - [NER-Aware Invalidation](#ner-aware-invalidation)
   - [Cache CLI](#cache-cli)
 - [📊 Experiments \& Benchmarks](#-experiments--benchmarks)
+  - [Results](#results)
   - [BBox Grid Search](#bbox-grid-search)
   - [Batch Multi-Model Experiments](#batch-multi-model-experiments)
 - [📑 Citation](#-citation)
@@ -399,6 +400,26 @@ python3 orchestrator/cache_utils.py validate --results-dir preprocessing/boundin
 ---
 
 ## 📊 Experiments & Benchmarks
+
+### Results
+
+Three multimodal models — **MedGemma 1.5 4B**, **MedGemma 4B**, and **OctoMed 7B** — were benchmarked across the GRIP grounding pathways (raw baseline → attention map → bounding box → segmentation, with and without NER query expansion) on the GEMeX-VQA stratified subset, judged by **Qwen2.5-7B-Instruct**.
+
+**Headline finding — visual grounding consistently improves Exact-Match accuracy over the raw-image baseline:**
+
+<p align="center">
+  <img src="assets/table_2.png" alt="Exact-Match improvement over raw-image baseline for each grounding pathway" width="780">
+</p>
+
+> **Table.** Per-model uplift of each grounding pathway over the raw-image baseline. The **Δ Baseline** column reports the absolute improvement in EM accuracy over the raw-image baseline for the same model. **Bounding-box prompting** yields the largest gain across all three models (up to **+33.07 pp** EM for MedGemma 4B). Grey-shaded cells mark the global best per metric; bold = best within a model class; underlined = second-best.
+
+**Full cross-model / cross-pipeline benchmark** — ROUGE-1/2/L, Exact-Match accuracy, and LLM-Judge accuracy for every combination of model × grounding pathway × query-expansion setting:
+
+<p align="center">
+  <img src="assets/table_1.png" alt="Full benchmark — ROUGE and accuracy across all models and pipeline variants" width="820">
+</p>
+
+> **Table.** Comprehensive evaluation matrix. **Legend:** 📄 = Query · 🔻 = NER enabled · 🖼 = Raw Image (baseline) · ✥ = Attention Map · ▢ = Bounding Box · ⛯ = Segmentation · 👁 = Generation · ⚖ = Evaluation. Values are percentages.
 
 ### BBox Grid Search
 
