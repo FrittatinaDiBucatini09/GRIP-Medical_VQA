@@ -368,6 +368,7 @@ content within these bounding boxes, as they highlight the most clinically relev
     </td>
   </tr>
 </table>
+
 ```
 **Visual Context:** This image features precise anatomical or pathological segmentation. The
 segmented areas of interest are highlighted in **green**, and are further encapsulated by an
