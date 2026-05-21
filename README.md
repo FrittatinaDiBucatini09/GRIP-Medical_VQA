@@ -1,52 +1,69 @@
-# 🏥 Pipeline VQA: Medical Visual Question Answering Framework
+<p align="center">
+  <img src="assets/GRIP_logo.png" alt="GRIP logo" width="340">
+</p>
 
-[![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-blue?logo=docker)](https://www.docker.com/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)](#)
-[![WandB](https://img.shields.io/badge/Weights_%26_Biases-FFBE00?logo=weightsandbiases&logoColor=black)](https://wandb.ai)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<h1 align="center">GRIP — Grounded Reasoning via Image Prompting</h1>
+<p align="center"><em>A modular framework for Medical Visual Question Answering with explicit visual grounding.</em></p>
 
-**Pipeline VQA** is a comprehensive, modular framework designed for automated Medical Visual Question Answering (VQA). This repository handles end-to-end processing of medical imaging datasets (like MIMIC-CXR and GEMEX), from raw data preparation and attention heatmap generation to precise image segmentation, bounding box extraction, and ultimately, VQA generation and automated evaluation via an LLM Judge.
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" alt="Python Version"></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/docker-ready-blue?logo=docker" alt="Docker"></a>
+  <a href="#"><img src="https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white" alt="PyTorch"></a>
+  <a href="https://wandb.ai"><img src="https://img.shields.io/badge/Weights_%26_Biases-FFBE00?logo=weightsandbiases&logoColor=black" alt="WandB"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
+
+**GRIP** (**G**rounded **R**easoning via **I**mage **P**rompting) is a comprehensive, modular framework for automated Medical Visual Question Answering (VQA). It handles end-to-end processing of medical imaging datasets (e.g. MIMIC-CXR, GEMeX) — from raw data preparation and attention-map generation, through bounding-box extraction and MedSAM-based segmentation, to multimodal VQA inference and automated evaluation via an LLM Judge.
 
 > 📄 **Thesis:** [docs/thesis.pdf](docs/thesis.pdf) · 🎞️ **Defense slides:** [docs/slides.pdf](docs/slides.pdf)
 >
 > Bachelor's thesis project — *"Evaluating Visual Grounding in MLLMs for Medical VQA"* — investigating whether explicit visual grounding (heatmaps, bounding boxes, segmentation masks) improves the answer quality of multimodal LLMs on chest X-ray VQA tasks.
 
 ## 📑 Table of Contents
-- [🏥 Pipeline VQA: Medical Visual Question Answering Framework](#-pipeline-vqa-medical-visual-question-answering-framework)
-  - [📑 Table of Contents](#-table-of-contents)
-  - [🏗 Architecture](#-architecture)
-    - [Agentic Query Expansion / Routing (Optional Middleware)](#agentic-query-expansion--routing-optional-middleware)
-  - [🗂 Repository Structure](#-repository-structure)
-  - [✨ Key Features](#-key-features)
-  - [⚙️ Installation \& Setup](#️-installation--setup)
-  - [🚀 Usage](#-usage)
-    - [Running the Orchestrator](#running-the-orchestrator)
-    - [Batch Experiment Generation](#batch-experiment-generation)
-    - [Running Individual Modules](#running-individual-modules)
-  - [💡 Intelligent Prompt Injection](#-intelligent-prompt-injection)
-    - [How It Works](#how-it-works)
-    - [Injected Context by Preprocessing Type](#injected-context-by-preprocessing-type)
-    - [Injected Text (Full)](#injected-text-full)
-    - [Standalone Usage](#standalone-usage)
-  - [🗃 Preprocessing Cache](#-preprocessing-cache)
-    - [Fingerprint Components](#fingerprint-components)
-    - [Decision Logic](#decision-logic)
-    - [NER-Aware Invalidation](#ner-aware-invalidation)
-    - [Cache CLI](#cache-cli)
-  - [📊 Experiments \& Benchmarks](#-experiments--benchmarks)
-    - [BBox Grid Search](#bbox-grid-search)
-    - [Batch Multi-Model Experiments](#batch-multi-model-experiments)
-  - [📑 Citation](#-citation)
-  - [👤 Author \& Acknowledgements](#-author--acknowledgements)
-  - [⚠️ Limitations \& Future Work](#️-limitations--future-work)
-  - [📜 License](#-license)
+- [📑 Table of Contents](#-table-of-contents)
+- [🏗 Architecture](#-architecture)
+  - [Pipeline Overview](#pipeline-overview)
+  - [Agentic Query Expansion / Routing (Optional Middleware)](#agentic-query-expansion--routing-optional-middleware)
+- [🗂 Repository Structure](#-repository-structure)
+- [✨ Key Features](#-key-features)
+- [⚙️ Installation \& Setup](#️-installation--setup)
+- [🚀 Usage](#-usage)
+  - [Running the Orchestrator](#running-the-orchestrator)
+  - [Batch Experiment Generation](#batch-experiment-generation)
+  - [Running Individual Modules](#running-individual-modules)
+- [💡 Intelligent Prompt Injection](#-intelligent-prompt-injection)
+  - [How It Works](#how-it-works)
+  - [Injected Context by Preprocessing Type](#injected-context-by-preprocessing-type)
+  - [Injected Text (Full)](#injected-text-full)
+  - [Standalone Usage](#standalone-usage)
+- [🗃 Preprocessing Cache](#-preprocessing-cache)
+  - [Fingerprint Components](#fingerprint-components)
+  - [Decision Logic](#decision-logic)
+  - [NER-Aware Invalidation](#ner-aware-invalidation)
+  - [Cache CLI](#cache-cli)
+- [📊 Experiments \& Benchmarks](#-experiments--benchmarks)
+  - [BBox Grid Search](#bbox-grid-search)
+  - [Batch Multi-Model Experiments](#batch-multi-model-experiments)
+- [📑 Citation](#-citation)
+- [👤 Author \& Acknowledgements](#-author--acknowledgements)
+- [⚠️ Limitations \& Future Work](#️-limitations--future-work)
+- [📜 License](#-license)
 
 ---
 
 ## 🏗 Architecture
 
-The pipeline is composed of highly decoupled modules communicating via shared file structures and orchestrated seamlessly. Preprocessing stages are **mutually exclusive alternatives** — you select one per run. Below is the full data flow:
+### Pipeline Overview
+
+GRIP organises Medical VQA into **four stages**: (1) clinical-query preprocessing with optional LLM-driven expansion, (2) visual feature extraction via a multimodal encoder that drives three alternative visual-prompting pathways — **bounding box**, **heatmap**, and **segmentation** — (3) VQA inference on the visually prompted image, and (4) automated scoring via an LLM Judge.
+
+<p align="center">
+  <img src="assets/GRIP_overview.png" alt="GRIP pipeline architectural overview" width="900">
+</p>
+
+> **Figure.** Architectural overview of the proposed Visual Grounding pipeline. The workflow proceeds through four stages: (1) *Preprocessing* — the clinical query is evaluated for specificity and optionally expanded by an LLM (Stage 𝒮₁); (2) *Visual Feature Extraction* — a Multimodal Encoder generates a shared attention map which drives three prompting pathways: Bounding Box, Heatmap, and Segmentation (Stages 𝒮₂–𝒮₃); (3) *VQA & Evaluation* — the visually prompted image is used to generate a diagnostic answer, which is scored by an LLM-Judge (Stage 𝒮₄). *Components designated as trainable indicate architectural support for end-to-end optimisation or fine-tuning by the user, rather than training procedures performed within the scope of this work.*
+
+The codebase is composed of highly decoupled modules communicating via shared file structures and orchestrated seamlessly. Preprocessing stages are **mutually exclusive alternatives** — you select one per run. The full data-flow graph is shown below:
 
 ```mermaid
 graph TD
@@ -117,7 +134,7 @@ If routing is **not** selected in the orchestrator, preprocessing stages fall ba
 ## 🗂 Repository Structure
 
 ```text
-pipeline-vqa/
+GRIP-Medical_VQA/
 ├── data_prep/                      <-- DATA ENGINEERING
 │   ├── prepare_gemex.py            # GEMeX dataset preparation
 │   ├── prepare_mimic_ext.py        # MIMIC-Ext dataset preparation
