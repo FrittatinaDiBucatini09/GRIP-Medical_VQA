@@ -315,6 +315,19 @@ The injection is a **prefix** prepended to the existing prompt template. The cor
 ### Injected Text (Full)
 
 **Attention Map (`attn_map`):**
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="assets/attn_1.png" alt="Example of Attention Map augmentation 1" width="400">
+      <br>
+    </td>
+    <td align="center">
+      <img src="assets/attn_2.png" alt="Example of Attention Map augmentation 2" width="400">
+      <br>
+    </td>
+  </tr>
+</table>
+
 ```
 **Visual Context:** This image contains a heatmap overlay representing Attention Weights
 from a visual model. Higher intensity areas (hotter colors such as red and yellow) indicate
@@ -323,6 +336,19 @@ Cooler colors (blue) indicate lower attention. Use these attention cues to guide
 ```
 
 **Bounding Box (`bbox_preproc`):**
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="assets/bbox_1.jpg" alt="Example of Bounding Box augmentation 1" width="400">
+      <br>
+    </td>
+    <td align="center">
+      <img src="assets/bbox_2.png" alt="Example of Bounding Box augmentation 2" width="400">
+      <br>
+    </td>
+  </tr>
+</table>
+
 ```
 **Visual Context:** Specific regions of interest in this image have been localized. The relevant
 findings or objects are enclosed in **red/fuchsia bounding boxes**. Focus your analysis on the
@@ -330,6 +356,18 @@ content within these bounding boxes, as they highlight the most clinically relev
 ```
 
 **Segmentation (`segmentation`):**
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="assets/seg_1.png" alt="Example of Segmentation augmentation 1" width="400">
+      <br>
+    </td>
+    <td align="center">
+      <img src="assets/seg_2.png" alt="Example of Segmentation augmentation 2" width="400">
+      <br>
+    </td>
+  </tr>
+</table>
 ```
 **Visual Context:** This image features precise anatomical or pathological segmentation. The
 segmented areas of interest are highlighted in **green**, and are further encapsulated by an
@@ -419,7 +457,9 @@ Three multimodal models — **MedGemma 1.5 4B**, **MedGemma 4B**, and **OctoMed 
   <img src="assets/table_1.png" alt="Full benchmark — ROUGE and accuracy across all models and pipeline variants" width="820">
 </p>
 
-> **Table.** Comprehensive evaluation matrix. **Legend:** 📄 = Query · 🔻 = NER enabled · 🖼 = Raw Image (baseline) · ✥ = Attention Map · ▢ = Bounding Box · ⛯ = Segmentation · 👁 = Generation · ⚖ = Evaluation. Values are percentages.
+> **Table.** Comprehensive evaluation matrix.
+
+For further information regarding the experiments, please consult **Chapter 5: Results** in [docs/thesis.pdf](docs/thesis.pdf).
 
 ### BBox Grid Search
 
