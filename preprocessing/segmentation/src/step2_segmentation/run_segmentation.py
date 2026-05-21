@@ -1,0 +1,584 @@
+import argparse
+import sys
+import os
+import json
+import torch
+import numpy as np
+import cv2
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+from pathlib import Path
+from tqdm import tqdm
+from typing import List, Dict, Any, Tuple
+import wandb
+import time
+
+def _init_wandb_safe(**kwargs):
+    """
+    Initialize WandB safely. If it fails, mock EVERYTHING so the script never crashes.
+    """
+    try:
+        wandb.init(**kwargs)
+    except Exception as exc:
+        print(f"[WARNING] WandB initialization failed completely: {exc}")
+        print("[INFO] Switching to MOCK mode. No metrics will be logged.")
+        
+        # Monkey-patch ALL commonly used wandb functions to no-ops
+        wandb.log = lambda *args, **kwargs: None
+        wandb.finish = lambda *args, **kwargs: None
+        wandb.define_metric = lambda *args, **kwargs: None
+        wandb.Image = lambda *args, **kwargs: None # Critical for image logging
+        
+        # Ensure os.environ reflects disabled state just in case
+        os.environ["WANDB_MODE"] = "disabled"
+
+# Try to import from local utils (module mode) or direct (script mode)
+try:
+    from .segmentation_utils import (
+        load_model, preprocess_image, save_mask,
+        generate_visual_prompt_image, apply_mask_overlay,
+        build_text_prompt, xyxy_to_cxcywh_norm,
+        ALL_MODEL_KEYS, TEXT_PROMPT_MODES
+    )
+except ImportError:
+    try:
+        from segmentation_utils import (
+            load_model, preprocess_image, save_mask,
+            generate_visual_prompt_image, apply_mask_overlay,
+            build_text_prompt, xyxy_to_cxcywh_norm,
+            ALL_MODEL_KEYS, TEXT_PROMPT_MODES
+        )
+    except ImportError as e:
+        sys.exit(f"[CRITICAL] Could not import segmentation_utils: {e}")
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+VALID_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.dcm'}
+
+def parse_box(box_data: Any) -> List[int]:
+    """Parses box data from various formats (list, string) to [x1, y1, x2, y2]."""
+    if isinstance(box_data, list):
+        # Handle nested list [[x1, y1, x2, y2]]
+        if len(box_data) > 0 and isinstance(box_data[0], list):
+            return [int(x) for x in box_data[0]]
+        return [int(x) for x in box_data]
+    return []
+
+
+# ==============================================================================
+# SAM1 / SAM2 INFERENCE (Bounding Box Prompts)
+# ==============================================================================
+
+def run_bbox_inference(predictor, img_input, prompt_box):
+    """Run inference with SAM1/SAM2 using bounding box prompt."""
+    predictor.set_image(img_input)
+    masks, scores, logits = predictor.predict(
+        point_coords=None,
+        point_labels=None,
+        box=prompt_box[None, :],  # (1, 4)
+        multimask_output=False,
+    )
+    return masks[0]  # (H, W)
+
+
+# ==============================================================================
+# SAM3 / MEDSAM3 INFERENCE (Text + Optional BBox Prompts)
+# ==============================================================================
+
+def run_sam3_text_inference(predictor, image_path, text_prompt):
+    """Run MedSAM3 inference with text prompt only."""
+    results = predictor.predict(image_path, [text_prompt])
+    return _extract_sam3_best_mask(results, image_path)
+
+
+def run_sam3_bbox_inference(predictor, image_path, box, img_width, img_height):
+    """
+    Run SAM3 inference with bounding box prompt via Sam3Processor API.
+    Uses add_geometric_prompt with normalized [cx, cy, w, h] coordinates.
+    """
+    from PIL import Image as PILImage
+    
+    try:
+        from sam3.model.sam3_image_processor import Sam3Processor
+    except ImportError:
+        raise ImportError("sam3 library not found for bbox inference.")
+    
+    # Get the underlying SAM3 model from the LoRA inference wrapper
+    sam3_model = predictor.model
+    processor = Sam3Processor(sam3_model)
+    
+    # Load image
+    pil_image = PILImage.open(image_path).convert("RGB")
+    inference_state = processor.set_image(pil_image)
+    
+    # Convert box to SAM3 format: [cx, cy, w, h] normalized [0,1]
+    norm_box = xyxy_to_cxcywh_norm(box, img_width, img_height)
+    
+    # Add geometric (box) prompt
+    output = processor.add_geometric_prompt(
+        state=inference_state,
+        box=norm_box,
+        label=True,  # positive prompt
+    )
+    
+    masks = output.get("masks")
+    if masks is not None and len(masks) > 0:
+        # Take the best mask (highest scoring)
+        scores = output.get("scores", [1.0])
+        if hasattr(masks, 'cpu'):
+            mask = masks[0].cpu().numpy()
+        elif isinstance(masks, np.ndarray):
+            mask = masks[0]
+        else:
+            mask = np.array(masks[0])
+        
+        if mask.ndim == 3:
+            mask = mask.squeeze(0)
+        return (mask > 0.5).astype(np.uint8)
+    
+    return None
+
+
+def run_sam3_combined_inference(predictor, image_path, text_prompt, box, img_width, img_height):
+    """
+    Run SAM3 inference with both text and bbox prompts.
+    Falls back to text-only if combined prompting fails.
+    """
+    from PIL import Image as PILImage
+    
+    try:
+        from sam3.model.sam3_image_processor import Sam3Processor
+    except ImportError:
+        # Fallback to text-only via LoRA inference
+        return run_sam3_text_inference(predictor, image_path, text_prompt)
+    
+    try:
+        sam3_model = predictor.model
+        processor = Sam3Processor(sam3_model)
+        
+        pil_image = PILImage.open(image_path).convert("RGB")
+        inference_state = processor.set_image(pil_image)
+        
+        # Set text prompt first
+        output = processor.set_text_prompt(
+            state=inference_state,
+            prompt=text_prompt,
+        )
+        
+        # Then add geometric prompt to refine
+        norm_box = xyxy_to_cxcywh_norm(box, img_width, img_height)
+        output = processor.add_geometric_prompt(
+            state=inference_state,
+            box=norm_box,
+            label=True,
+        )
+        
+        masks = output.get("masks")
+        if masks is not None and len(masks) > 0:
+            if hasattr(masks, 'cpu'):
+                mask = masks[0].cpu().numpy()
+            elif isinstance(masks, np.ndarray):
+                mask = masks[0]
+            else:
+                mask = np.array(masks[0])
+            
+            if mask.ndim == 3:
+                mask = mask.squeeze(0)
+            return (mask > 0.5).astype(np.uint8)
+    except Exception as e:
+        print(f"[WARN] Combined text+bbox failed ({e}), falling back to text-only")
+    
+    return run_sam3_text_inference(predictor, image_path, text_prompt)
+
+
+# ==============================================================================
+# MEDICAL-SAM3 (AIM-Research-Lab) INFERENCE
+# ==============================================================================
+
+def _aim_load_rgb(image_path):
+    """Load image as RGB ndarray for AIM SAM3Model.encode_image()."""
+    from PIL import Image as PILImage
+    pil = PILImage.open(image_path).convert("RGB")
+    return np.array(pil), pil.size  # (H,W,3), (W,H)
+
+
+def run_aim_sam3_text_inference(predictor, image_path, text_prompt):
+    """Run AIM Medical-SAM3 inference with text prompt only."""
+    image_rgb, _ = _aim_load_rgb(image_path)
+    state = predictor.encode_image(image_rgb)
+    mask = predictor.predict_text(state, text_prompt)
+    if mask is None:
+        return np.zeros(image_rgb.shape[:2], dtype=np.uint8)
+    if mask.ndim == 3:
+        mask = mask.squeeze(0)
+    return mask.astype(np.uint8)
+
+
+def run_aim_sam3_bbox_inference(predictor, image_path, box, img_width, img_height):
+    """Run AIM Medical-SAM3 inference with bounding box prompt only."""
+    image_rgb, _ = _aim_load_rgb(image_path)
+    state = predictor.encode_image(image_rgb)
+    bbox = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+    mask = predictor.predict_box(state, bbox, (img_height, img_width))
+    if mask is None:
+        return np.zeros((img_height, img_width), dtype=np.uint8)
+    if mask.ndim == 3:
+        mask = mask.squeeze(0)
+    return mask.astype(np.uint8)
+
+
+def run_aim_sam3_combined_inference(predictor, image_path, text_prompt, box, img_width, img_height):
+    """
+    Run AIM Medical-SAM3 with both text and bbox prompts.
+
+    The wrapper exposes only single-prompt-type predict_* helpers (each calls
+    reset_all_prompts internally). To combine, we drive the underlying
+    Sam3Processor directly: set text prompt, then add geometric prompt to refine.
+    Falls back to text-only on failure.
+    """
+    from PIL import Image as PILImage
+
+    try:
+        image_rgb, _ = _aim_load_rgb(image_path)
+        state = predictor.encode_image(image_rgb)
+
+        processor = predictor.processor
+        processor.reset_all_prompts(state)
+
+        # Text prompt first
+        processor.set_text_prompt(state=state, prompt=text_prompt)
+
+        # Then refine with geometric (box) prompt — Sam3 expects normalized cxcywh
+        norm_box = xyxy_to_cxcywh_norm([int(b) for b in box], img_width, img_height)
+        out = processor.add_geometric_prompt(state=state, box=norm_box, label=True)
+
+        masks = out.get("masks") if isinstance(out, dict) else None
+        if masks is not None and len(masks) > 0:
+            scores = out.get("scores")
+            if scores is not None and len(scores) > 0:
+                import torch as _torch
+                best_idx = int(_torch.argmax(scores).item()) if hasattr(scores, "argmax") else 0
+            else:
+                best_idx = 0
+            m = masks[best_idx]
+            if hasattr(m, "cpu"):
+                m = m.cpu().numpy()
+            elif not isinstance(m, np.ndarray):
+                m = np.array(m)
+            if m.ndim == 3:
+                m = m.squeeze(0)
+            return (m > 0.5).astype(np.uint8)
+    except Exception as e:
+        print(f"[WARN] AIM Medical-SAM3 combined text+bbox failed ({e}), falling back to text-only")
+
+    return run_aim_sam3_text_inference(predictor, image_path, text_prompt)
+
+
+def _extract_sam3_best_mask(results, image_path):
+    """
+    Extract the best mask from SAM3LoRAInference results.
+    Returns a binary mask (H, W) or None if no detections.
+    """
+    best_mask = None
+    best_score = -1.0
+    
+    for key in results:
+        if key == '_image':
+            continue
+        result = results[key]
+        if result['num_detections'] > 0 and result['masks'] is not None:
+            # Find the detection with the highest score
+            max_idx = np.argmax(result['scores'])
+            score = result['scores'][max_idx]
+            if score > best_score:
+                best_score = score
+                mask = result['masks'][max_idx]
+                if mask.ndim == 3:
+                    mask = mask.squeeze(0)
+                best_mask = mask.astype(np.uint8)
+    
+    if best_mask is None:
+        # Create empty mask with image dimensions
+        from PIL import Image as PILImage
+        try:
+            img = PILImage.open(image_path)
+            w, h = img.size
+            best_mask = np.zeros((h, w), dtype=np.uint8)
+        except Exception:
+            best_mask = np.zeros((512, 512), dtype=np.uint8)
+    
+    return best_mask
+
+
+# ==============================================================================
+# MAIN INFERENCE LOOP
+# ==============================================================================
+
+def run_inference(args):
+    # 1. Setup
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    
+    # Load Model (auto-detects SAM1 vs SAM2 vs SAM3)
+    print(f"Loading model: {args.model_checkpoint}")
+    predictor, model_family = load_model(
+        args.model_checkpoint,
+        device=device,
+        model_cfg=args.model_cfg,
+        sam3_cfg=args.sam3_cfg,
+    )
+    print(f"Model family: {model_family.upper()}")
+    
+    is_sam3_joey = (model_family == "sam3")
+    is_sam3_aim = (model_family == "sam3_aim")
+    is_sam3 = is_sam3_joey or is_sam3_aim  # any text-prompt-capable SAM3 family
+
+    if is_sam3:
+        print(f"Text prompt mode: {args.text_prompt_mode}")
+        print(f"Use bbox with SAM3: {args.sam3_use_bbox}")
+    
+    # Output Directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    mask_dir = os.path.join(args.output_dir, "masks")
+    overlay_dir = os.path.join(args.output_dir, "overlays")
+    os.makedirs(mask_dir, exist_ok=True)
+    if args.save_overlays:
+        os.makedirs(overlay_dir, exist_ok=True)
+
+    # --- WandB Initialization ---
+    if "WANDB_API_KEY" not in os.environ:
+        print("[WARNING] WANDB_API_KEY not found. Runs will be offline.")
+        os.environ.setdefault("WANDB_MODE", "offline")
+
+    _wandb_group = (
+        os.environ.get("WANDB_RUN_GROUP")
+        or (Path(args.output_dir).parent.name if args.output_dir else None)
+        or f"solo-{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    _init_wandb_safe(
+        project="GEMeX-VQA-Pipeline",
+        name=os.environ.get("WANDB_RUN_NAME") or f"segmentation-{Path(args.model_checkpoint).stem}",
+        group=_wandb_group,
+        job_type="step2-segmentation",
+        tags=["segmentation", "medsam", args.scenario],
+        config=vars(args),
+        dir=args.output_dir,
+    )
+    # Define metrics
+    try:
+        wandb.define_metric("processed_images", summary="max")
+        wandb.define_metric("skipped_images", summary="max")
+    except:
+        pass
+
+    # 2. Load Data (JSONL)
+    print(f"Reading predictions from: {args.input_file}")
+    with open(args.input_file, 'r') as f:
+        lines = f.readlines()
+        
+    data = [json.loads(line) for line in lines]
+    
+    # 3. Filtering/Limiting
+    if args.limit:
+        print(f"Limiting to first {args.limit} samples.")
+        data = data[:args.limit]
+
+    print(f"Processing {len(data)} samples in Mode: {args.scenario}")
+
+    # Counters
+    processed = 0
+    skipped = 0
+    vqa_manifest_records = []  # Collects (image_path, question, answer) for VQA bridge
+
+    # 4. Processing Loop
+    for item in tqdm(data):
+        image_path = item.get('image_path') or item.get('path')
+        # Handle relative paths
+        if args.input_root and not os.path.isabs(image_path):
+            image_path = os.path.join(args.input_root, image_path)
+            
+        if not os.path.exists(image_path):
+            print(f"[WARN] Image not found: {image_path}")
+            skipped += 1
+            continue
+
+        # Parse bounding box (used by SAM1/SAM2, optional for SAM3)
+        box = parse_box(
+            item.get('box') or item.get('bbox') or 
+            item.get('visual_locations') or item.get('predicted_boxes')
+        )
+        if not box:
+            boxes = item.get('boxes') or item.get('valid_boxes') or item.get('predicted_boxes')
+            if boxes and isinstance(boxes, list) and len(boxes) > 0:
+                if isinstance(boxes[0], list):
+                    box = [int(x) for x in boxes[0]]
+                else:
+                    box = [int(x) for x in boxes]
+
+        # For SAM1/SAM2: bbox is required
+        if not is_sam3 and (not box or len(box) < 4):
+            skipped += 1
+            continue
+
+        # =====================================================================
+        # SAM3 / MedSAM3 PATH (Text-Prompted Segmentation)
+        # =====================================================================
+        if is_sam3:
+            # Build text prompt from JSONL fields
+            text_prompt = build_text_prompt(item, mode=args.text_prompt_mode)
+
+            # Pick the inference adapters for the active SAM3 family
+            if is_sam3_aim:
+                _text_fn = run_aim_sam3_text_inference
+                _combined_fn = run_aim_sam3_combined_inference
+            else:
+                _text_fn = run_sam3_text_inference
+                _combined_fn = run_sam3_combined_inference
+
+            # Decide inference strategy
+            if args.sam3_use_bbox and box and len(box) >= 4:
+                # Load image to get dimensions
+                try:
+                    image = preprocess_image(image_path)
+                    img_h, img_w = image.shape[:2]
+                except Exception as e:
+                    print(f"[ERR] {e}")
+                    skipped += 1
+                    continue
+
+                # Combined text + bbox inference
+                best_mask = _combined_fn(
+                    predictor, image_path, text_prompt, box, img_w, img_h
+                )
+            else:
+                # Text-only inference
+                best_mask = _text_fn(predictor, image_path, text_prompt)
+                # Load image for overlay (needed below)
+                try:
+                    image = preprocess_image(image_path)
+                except Exception as e:
+                    print(f"[ERR] {e}")
+                    skipped += 1
+                    continue
+
+        # =====================================================================
+        # SAM1 / SAM2 PATH (Bounding Box Segmentation)
+        # =====================================================================
+        else:
+            try:
+                image = preprocess_image(image_path)
+            except Exception as e:
+                print(f"[ERR] {e}")
+                skipped += 1
+                continue
+
+            img_input = image.copy()
+            prompt_box = np.array(box)
+
+            # Scenario handling
+            if args.scenario == 'B':
+                img_input = generate_visual_prompt_image(img_input, box, color=(255, 0, 0))
+            elif args.scenario == 'C':
+                img_input = generate_visual_prompt_image(img_input, box, color=(255, 0, 0))
+                prompt_box = prompt_box + 50 
+                
+            best_mask = run_bbox_inference(predictor, img_input, prompt_box)
+
+        # =====================================================================
+        # SAVE RESULTS (shared by all model families)
+        # =====================================================================
+        if best_mask is None:
+            skipped += 1
+            continue
+            
+        filename = Path(image_path).stem
+        q_idx = item.get('question_idx', item.get('idx', item.get('q_id', '')))
+        out_name = f"{filename}_q{q_idx}" if q_idx else filename
+            
+        mask_path = os.path.join(mask_dir, f"{out_name}_mask.png")
+        if not args.skip_mask_saving:
+            save_mask(best_mask, mask_path)
+        
+        if args.save_overlays:
+            overlay = apply_mask_overlay(image, best_mask)
+            if box and len(box) >= 4:
+                prompt_box_draw = np.array(box)
+                cv2.rectangle(
+                    overlay,
+                    (int(prompt_box_draw[0]), int(prompt_box_draw[1])),
+                    (int(prompt_box_draw[2]), int(prompt_box_draw[3])),
+                    (0, 255, 255), 2
+                )
+            overlay_filename = f"{out_name}_overlay.png"
+            cv2.imwrite(
+                os.path.join(overlay_dir, overlay_filename),
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            )
+
+            # Collect record for VQA manifest (overlay is the VQA-relevant image)
+            vqa_manifest_records.append({
+                'image_path': f"overlays/{overlay_filename}",
+                'question': item.get('question', item.get('prompt_used', '')),
+                'answer': item.get('answer_text', item.get('answer', '')),
+            })
+
+        processed += 1
+        
+        # Log progress periodically
+        if processed % 10 == 0:
+            wandb.log({"processed_images": processed, "skipped_images": skipped})
+
+    print(f"Done. Processed: {processed} | Skipped: {skipped}")
+    wandb.log({"processed_images": processed, "skipped_images": skipped})
+    wandb.finish()
+
+    # Generate VQA-ready manifest for downstream pipeline stages
+    if vqa_manifest_records:
+        import pandas as pd_manifest
+        manifest_path = os.path.join(args.output_dir, "vqa_manifest.csv")
+        pd_manifest.DataFrame(vqa_manifest_records).to_csv(manifest_path, index=False)
+        print(f"[INFO] VQA manifest generated: {manifest_path} ({len(vqa_manifest_records)} rows)")
+    else:
+        print("[WARNING] No overlay records collected. VQA manifest not generated.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Medical Image Segmentation (SAM1 / MedSAM2 / MedSAM3)")
+    
+    # Input / Output
+    parser.add_argument('--input_file', type=str, required=True, help="Path to predictions.jsonl from Step 1")
+    parser.add_argument('--input_root', type=str, default="", help="Root directory to prepend to relative image paths")
+    parser.add_argument('--output_dir', type=str, required=True)
+    
+    # Model Selection
+    parser.add_argument('--model_checkpoint', type=str, default="medsam",
+                        help=f"Model key or path. Keys: {sorted(ALL_MODEL_KEYS)}")
+    parser.add_argument('--model_cfg', type=str, default="configs/sam2.1_hiera_t512.yaml",
+                        help="SAM2 config YAML (only for MedSAM2 models)")
+    parser.add_argument('--sam3_cfg', type=str, default="configs/full_lora_config.yaml",
+                        help="MedSAM3/SAM3 config YAML (only for MedSAM3 models)")
+    
+    # Experiment
+    parser.add_argument('--scenario', type=str, choices=['A', 'B', 'C'], default='A',
+                        help="A=Clean, B=VisualPrompt, C=Adversarial (SAM1/SAM2 only)")
+    parser.add_argument('--limit', type=int, help="Process only N samples")
+    parser.add_argument('--save_overlays', action='store_true', help="Save visualization overlays")
+    parser.add_argument('--skip_mask_saving', action='store_true', help="Disable saving of binary masks to disk")
+    
+    # MedSAM3 Text Prompt Options
+    parser.add_argument('--text_prompt_mode', type=str, default="question",
+                        choices=sorted(TEXT_PROMPT_MODES),
+                        help="Text prompt mode for MedSAM3: "
+                             "'regions' = visual_regions only, "
+                             "'regions_question' = visual_regions + question, "
+                             "'question' = question only (default)")
+    parser.add_argument('--sam3_use_bbox', action='store_true',
+                        help="Also pass bounding box as geometric prompt to SAM3 (in addition to text)")
+    
+    args = parser.parse_args()
+    run_inference(args)
+
+if __name__ == "__main__":
+    main()

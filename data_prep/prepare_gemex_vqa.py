@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+GEMeX to MIMIC-CXR Mapping Utility (Census Edition)
+===================================================
+Description:
+    Aligns metadata from the GEMeX-VQA dataset with local MIMIC-CXR images.
+    
+    UPDATES:
+    - Integrity Fix: Preserves 'choices' and ensures 'question' is not corrupted by CSV formatting.
+    - Diagnostic Census: Explicitly counts p10-p19 coverage.
+    - Direct HTTP: Uses robust download method.
+
+Usage:
+    python3 prepare_gemex_vqa.py
+"""
+
+import os
+import json
+import random
+import argparse
+import requests
+import pandas as pd
+import csv
+from pathlib import Path
+from tqdm import tqdm
+from huggingface_hub import list_repo_files
+import sys
+import tempfile
+
+# Add current directory to path to import utils
+sys.path.append(str(Path(__file__).parent))
+import utils
+
+# --- CONFIGURATION DEFAULTS ---
+DEFAULT_MIMIC_ROOT_DIR = "/datasets/MIMIC-CXR/files"
+BASE_FILENAME = "gemex_vqa_mimic_mapped"
+VALID_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.dcm', '.webp'}
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='GEMeX-VQA to MIMIC-CXR Mapping Utility')
+    parser.add_argument('--mimic_root_dir', type=str, default=DEFAULT_MIMIC_ROOT_DIR,
+                       help='Root directory of MIMIC-CXR files')
+    parser.add_argument('--max_questions_per_image', type=int, default=None,
+                       help='Max questions per image (None for all)')
+    parser.add_argument('--limit', type=int, default=None,
+                       help='Limit the total number of samples (default: None/All)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
+    return parser.parse_args()
+
+def download_file_direct(repo_id, filename, local_dir):
+    """Bypasses LFS pointers by forcing raw HTTP download."""
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
+    local_path = os.path.join(local_dir, filename)
+    
+    if os.path.exists(local_path):
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        if size_mb > 1.0: # Assume >1MB is a real file
+            print(f"   [SKIP] File {filename} seems valid locally ({size_mb:.2f} MB).")
+            return local_path
+    
+    print(f"   [HTTP] Downloading {url}...")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(local_path, 'wb') as f, tqdm(
+            desc=filename, total=int(r.headers.get('content-length', 0)),
+            unit='iB', unit_scale=True, unit_divisor=1024,
+        ) as bar:
+            for chunk in r.iter_content(chunk_size=8192):
+                size = f.write(chunk)
+                bar.update(size)
+    return local_path
+
+def main():
+    args = parse_args()
+    REPO_ID = "BoKelvin/GEMeX-VQA"
+    MIMIC_ROOT_DIR = Path(args.mimic_root_dir)
+    MAX_QUESTIONS_PER_IMAGE = args.max_questions_per_image
+    LIMIT = args.limit
+    RANDOM_SEED = args.seed
+
+     # Generate output filename based on limit
+    if LIMIT:
+        OUTPUT_FILENAME = f"{BASE_FILENAME}_{LIMIT}_samples.csv"
+        print(f"[INFO] Limit set to {LIMIT} samples. Output: {OUTPUT_FILENAME}")
+    else:
+        OUTPUT_FILENAME = f"{BASE_FILENAME}.csv"
+        print(f"[INFO] No limit set. Output: {OUTPUT_FILENAME}")
+
+    OUTPUT_CSV = Path(tempfile.gettempdir()) / OUTPUT_FILENAME
+
+    print("[INFO] Setting random seed for reproducibility...")
+    random.seed(RANDOM_SEED)
+
+    # --- 1. INDEXING LOCAL FILES ---
+    if not MIMIC_ROOT_DIR.exists():
+        print(f"[CRITICAL] Directory not found: {MIMIC_ROOT_DIR}")
+        return
+
+    print(f"[INFO] Indexing local files in {MIMIC_ROOT_DIR}...")
+    local_files_map = {}
+    folder_census = {} 
+    
+    for f in tqdm(MIMIC_ROOT_DIR.rglob('*'), desc="Indexing Filesystem"):
+        if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS:
+            local_files_map[f.stem] = str(f)
+            
+            # DIAGNOSTIC: Check pXX folder
+            for part in f.parts:
+                if len(part) == 3 and part.startswith('p1') and part[1:].isdigit():
+                    folder_census[part] = folder_census.get(part, 0) + 1
+                    break 
+
+    print(f"[INFO] Indexed {len(local_files_map)} local images.")
+    
+    # --- PRINT CENSUS REPORT ---
+    print("\n" + "="*40)
+    print("      LOCAL DATASET CENSUS REPORT")
+    print("="*40)
+    if not folder_census:
+        print("[WARNING] Could not detect p10-p19 structure. Check paths.")
+    else:
+        keys = sorted(folder_census.keys())
+        for k in keys:
+            print(f"  Folder {k}/ : {folder_census[k]} images")
+    print("="*40 + "\n")
+
+    if len(local_files_map) == 0:
+        print("[CRITICAL] No images found locally.")
+        return
+
+    # --- 2. FILE LISTING ---
+    print(f"[INFO] Fetching file list from {REPO_ID}...")
+    try:
+        all_files = list_repo_files(repo_id=REPO_ID, repo_type="dataset")
+        jsonl_files = [f for f in all_files if f.endswith(".jsonl")]
+    except Exception as e:
+        print(f"[CRITICAL] Failed to list repo files: {e}")
+        return
+
+    download_dir = Path("gemex_cache")
+    download_dir.mkdir(exist_ok=True)
+    matched_rows = []
+
+    # --- 3. DOWNLOAD & MATCH ---
+    for file_name in jsonl_files:
+        print(f"\n-> Processing {file_name}...")
+        try:
+            local_path = download_file_direct(REPO_ID, file_name, str(download_dir))
+            
+            print("   [READ] Scanning rows...")
+            with open(local_path, 'r', encoding='utf-8') as f:
+                for line in tqdm(f, desc="Parsing JSON", unit=" lines"):
+                    if not line.strip(): continue
+                    try:
+                        sample = json.loads(line)
+                    except json.JSONDecodeError: continue
+                    
+                    raw_path = sample.get('image_path') or sample.get('image_id')
+                    if not raw_path: continue
+                    
+                    stem_id = Path(str(raw_path)).stem
+                    
+                    if stem_id in local_files_map:
+                        resolved_path = local_files_map[stem_id]
+                        if not os.path.exists(resolved_path):
+                            continue
+                        sample['image_path'] = resolved_path
+                        sample['stem_id'] = stem_id
+                        sample['original_hf_path'] = raw_path
+                        matched_rows.append(sample)
+                        
+        except Exception as e:
+            print(f"   [ERROR] Failed to process {file_name}: {e}")
+
+    print(f"\n[INFO] Total matches found: {len(matched_rows)}")
+    
+    if len(matched_rows) == 0:
+        print("[WARNING] No matches found.")
+        return
+
+    # --- 4. EXPORT & SAMPLING ---
+    print("-> Creating DataFrame and applying sampling...")
+    df_gemex = pd.DataFrame(matched_rows)
+    final_rows = []
+    
+    # Per-image sampling first
+    if MAX_QUESTIONS_PER_IMAGE:
+        print(f"-> Sampling max {MAX_QUESTIONS_PER_IMAGE} Qs/img...")
+        grouped = df_gemex.groupby('stem_id')
+        for stem_id, group in tqdm(grouped, desc="Sampling Per-Image"):
+            if len(group) > MAX_QUESTIONS_PER_IMAGE:
+                sampled = group.sample(n=MAX_QUESTIONS_PER_IMAGE, random_state=RANDOM_SEED)
+            else:
+                sampled = group
+            final_rows.extend(sampled.to_dict('records'))
+    else:
+        final_rows = df_gemex.to_dict('records')
+
+    # Global LIMIT sampling second
+    if LIMIT:
+        if LIMIT < len(final_rows):
+            print(f"[INFO] Applying global limit: sampling {LIMIT} rows from {len(final_rows)} total...")
+            final_rows = random.sample(final_rows, LIMIT)
+        else:
+             print(f"[INFO] Global limit {LIMIT} >= Total rows {len(final_rows)}. Keeping all.")
+
+    df_final = pd.DataFrame(final_rows)
+    if 'stem_id' in df_final.columns:
+        df_final.drop(columns=['stem_id'], inplace=True)
+    
+    # --- INTEGRITY FIX: SALVATAGGIO CSV ROBUSTO ---
+    df_final.to_csv(
+        OUTPUT_CSV,
+        index=False,
+        quoting=csv.QUOTE_ALL,
+        escapechar='\\'
+    )
+
+    print("-" * 40)
+    print(f"[SUCCESS] Dataset saved to {OUTPUT_CSV}")
+    if not df_final.empty:
+        print(f"[STATS]   Unique Images: {df_final['image_path'].nunique()}")
+        print(f"[STATS]   Total QA Pairs: {len(df_final)}")
+    print("-" * 40)
+
+    # --- AUTOMATIC DISTRIBUTION ---
+    utils.distribute_file(OUTPUT_CSV)
+
+if __name__ == "__main__":
+    main()

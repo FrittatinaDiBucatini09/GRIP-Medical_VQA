@@ -1,0 +1,144 @@
+# ==============================================================================
+# DOCKERFILE: MedSAM3 (SAM3 + LoRA) Pipeline
+# ==============================================================================
+# Uses CUDA 12.2 base (compatible with cluster driver) + Python 3.12 via PPA.
+# PyTorch 2.7 bundles its own CUDA runtime, so the container CUDA version
+# only needs to match the host driver — not SAM3's docs.
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+LABEL maintainer="Thesis-Segmentation-Project"
+
+# ==============================================================================
+# 1. ENVIRONMENT SETUP
+# ==============================================================================
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /workspace
+
+# PYTHONPATH for modular imports
+# /opt/MedSAM3              → Joey-S-Liu MedSAM3 (LoRA): infer_sam, lora_layers
+# /opt/Medical-SAM3/inference → AIM-Research-Lab Medical-SAM3: sam3_inference (SAM3Model)
+ENV PYTHONPATH="${PYTHONPATH}:/workspace/src:/opt/MedSAM3:/opt/Medical-SAM3/inference"
+
+# ==============================================================================
+# 2. SYSTEM DEPENDENCIES + Python 3.12
+# ==============================================================================
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    wget \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3.12-tk \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ==============================================================================
+# 3. PYTHON VIRTUAL ENVIRONMENT (3.12)
+# ==============================================================================
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir \
+    wheel \
+    setuptools \
+    packaging \
+    ninja \
+    wrapt
+
+# ==============================================================================
+# 4. PYTORCH INSTALLATION (2.5.1 with cu121 — compatible with host driver)
+# ==============================================================================
+RUN pip install --no-cache-dir \
+    torch==2.5.1 \
+    torchvision \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# ==============================================================================
+# 5. SAM3 BASE MODEL (Facebook Research)
+# ==============================================================================
+RUN git clone https://github.com/facebookresearch/sam3.git /opt/sam3 && \
+    cd /opt/sam3 && \
+    pip install --no-cache-dir -e . && \
+    rm -rf /opt/sam3/.git
+
+# ==============================================================================
+# 6. MEDSAM3 (SAM3 + LoRA Fine-tuning — Joey-S-Liu)
+# ==============================================================================
+# The upstream setup.py pins torch>=2.7.0 / torchvision>=0.19.0. The cluster
+# driver maxes out at CUDA 12.4, for which the highest available wheel is
+# torch 2.6.0+cu124 — so honoring the >=2.7 constraint forces pip to grab the
+# default-PyPI cu130 wheel and the container then refuses to initialise CUDA
+# ("driver too old, found version 12040"). The runtime only uses stable torch
+# APIs that have existed since 2.0, so we strip the version pins before
+# editable install. Torch stays at the version pinned in section 4.
+RUN git clone https://github.com/Joey-S-Liu/MedSAM3.git /opt/MedSAM3 && \
+    cd /opt/MedSAM3 && \
+    sed -i -E 's/"torch>=[^"]*"/"torch"/g; s/"torchvision>=[^"]*"/"torchvision"/g' setup.py && \
+    pip install --no-cache-dir -e . && \
+    rm -rf /opt/MedSAM3/.git
+
+# ==============================================================================
+# 6b. MEDICAL-SAM3 (AIM-Research-Lab — full fine-tune, not LoRA)
+# ==============================================================================
+# Repo is a script collection (no setup.py); we just clone and add
+# /opt/Medical-SAM3/inference to PYTHONPATH (set in section 1).
+# Its requirements are a strict subset of what's already installed below,
+# but install them defensively in case the upstream list grows.
+RUN git clone https://github.com/AIM-Research-Lab/Medical-SAM3.git /opt/Medical-SAM3 && \
+    rm -rf /opt/Medical-SAM3/.git && \
+    grep -vE "^\s*#|^\s*$|^torch|^torchvision" /opt/Medical-SAM3/requirements.txt > /tmp/medical_sam3_reqs.txt && \
+    pip install --no-cache-dir -r /tmp/medical_sam3_reqs.txt && \
+    rm -f /tmp/medical_sam3_reqs.txt
+
+# ==============================================================================
+# 7. PROJECT DEPENDENCIES
+# ==============================================================================
+COPY docker/requirements.txt .
+
+# Install deps (filter torch to avoid overwriting, filter segment-anything as not needed here)
+RUN grep -vE "^torch|^torchvision|^torchaudio|segment-anything" requirements.txt > requirements_clean.txt && \
+    pip install --no-cache-dir -r requirements_clean.txt
+
+# ==============================================================================
+# 7b. FINAL TORCH PIN (defensive)
+# ==============================================================================
+# Belt-and-braces: re-assert torch==2.5.1+cu121 in case any earlier editable
+# install or transitive dep silently bumped it. The cluster driver is capped
+# at CUDA 12.4; cu121 wheels remain forward-compatible with that driver.
+# Fail loudly at build time if the resulting torch can't even import the CUDA
+# extension matching the driver — far cheaper than discovering it inside SLURM.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+        --index-url https://download.pytorch.org/whl/cu121 && \
+    python -c "import torch; assert torch.__version__.startswith('2.5.1'), torch.__version__; print('[OK] torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# ==============================================================================
+# 8. SOURCE CODE & FILE SYSTEM
+# ==============================================================================
+COPY src /workspace/src
+
+RUN mkdir -p /workspace/data/results \
+             /workspace/checkpoints \
+             /workspace/configs \
+             /workspace/metadata \
+             /workspace/hf_cache
+
+VOLUME ["/workspace/data", "/workspace/checkpoints", "/workspace/configs"]
+
+# ==============================================================================
+# 9. ENTRYPOINT
+# ==============================================================================
+CMD ["python3", "-c", "print('✅ MedSAM3 Container Ready. Use ./run_pipeline.sh to start.')"]

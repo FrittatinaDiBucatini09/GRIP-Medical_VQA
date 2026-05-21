@@ -1,0 +1,93 @@
+.
+|-- CITATION.cff
+|-- LICENSE
+|-- README.md
+|-- archive_results.py
+|-- backfill_manifest_answers.py
+|-- build_all_images.sh
+|-- clean_results.sh
+|-- data_prep
+|   |-- README.md
+|   |-- clean_generated_datasets.py
+|   |-- create_stratified_samples.py
+|   |-- prepare_gemex.py
+|   |-- prepare_gemex_vqa.py
+|   |-- prepare_mimic_ext.py
+|   |-- requirements.txt
+|   |-- run_all_prep.sh
+|   `-- utils.py
+|-- docs
+|   |-- bias_calculation.py
+|   |-- dataset_distribution_analysis.md
+|   |-- repo_tree.txt
+|   |-- slides.pdf
+|   `-- thesis.pdf
+|-- experiments
+|   `-- 01_bbox_gridsearch
+|       |-- generate_grid_configs.py
+|       `-- submit_benchmark.sh
+|-- orchestrator
+|   |-- README.md
+|   |-- cache_utils.py
+|   |-- orchestrator.py
+|   `-- slurm_templates.py
+|-- preprocessing
+|   |-- attention_map
+|   |   |-- README.md
+|   |   |-- configs
+|   |   |-- docker
+|   |   |-- scripts
+|   |   |-- src
+|   |   `-- submit_heatmap_gen.sh
+|   |-- bounding_box
+|   |   |-- README.md
+|   |   |-- README_eval.md
+|   |   |-- SAMPLING_STRATEGY.md
+|   |   |-- configs
+|   |   |-- docker
+|   |   |-- scripts
+|   |   |-- src
+|   |   |-- submit_bbox_preprocessing.sh
+|   |   `-- submit_evaluation.sh
+|   |-- medclip_routing
+|   |   |-- README.md
+|   |   |-- configs
+|   |   |-- docker
+|   |   |-- scripts
+|   |   |-- src
+|   |   `-- submit_routing.sh
+|   `-- segmentation
+|       |-- README.md
+|       |-- configs
+|       |-- docker
+|       |-- scripts
+|       |-- src
+|       `-- submit_segmentation.sh
+|-- run_orchestrator.sh
+|-- tests
+|   |-- README.md
+|   |-- test_bridge.py
+|   |-- test_end_to_end_judge.py
+|   |-- test_error_handling.py
+|   |-- test_imports.py
+|   |-- test_integration_pipeline.py
+|   |-- test_judge_parsing.py
+|   `-- test_orchestrator.py
+`-- vqa
+    |-- README.md
+    |-- configs
+    |   |-- generation
+    |   `-- judge
+    |-- docker
+    |   |-- Dockerfile.3090
+    |   |-- Dockerfile.5090
+    |   `-- requirements.txt
+    |-- scripts
+    |   |-- build_image.sh
+    |   |-- run_generation.sh
+    |   `-- run_judge.sh
+    |-- src
+    |   |-- generate_vqa.py
+    |   `-- llm_judge.py
+    |-- submit_generation.sh
+    `-- submit_integration_test.sh

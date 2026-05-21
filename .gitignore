@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.orchestrator_env/
+
+# Environment variables
+.env
+.env.*
+
+# macOS
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# SLURM / HPC artifacts
+slurm-*.out
+slurm-*.err
+orchestrator_runs/
+
+# Pipeline outputs (generated at runtime)
+results/
+*/results/
+*/results/**
+logs/
+*/logs/
+
+# Checkpoints
+checkpoints/
+*/checkpoints/
+
+# Backup files created by backfill_manifest_answers.py
+*.csv.bak
+
+# Images extracted from HuggingFace datasets
+images/
+*/images/
+
+# Cache state files
+.preproc_cache_state.json
+
+# Generated experiment configs
+experiments/01_bbox_gridsearch/generated_configs/benchmark/
+experiments/01_bbox_gridsearch/generated_configs/benchmark_v2/

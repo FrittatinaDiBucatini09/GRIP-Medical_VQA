@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "GRIP: Evaluating Visual Grounding in Multimodal LLMs for Medical VQA"
+authors:
+  - family-names: Balzani
+    given-names: Riccardo
+type: software
+license: MIT
+date-released: 2026-05-21
+url: "https://github.com/FrittatinaDiBucatini09/GRIP-Medical_VQA"
+keywords:
+  - medical-vqa
+  - visual-grounding
+  - multimodal-llm
+  - medgemma
+  - medsam
+  - biomedclip
+  - chest-x-ray
+preferred-citation:
+  type: thesis
+  title: "Evaluating Visual Grounding in Multimodal LLMs for Medical VQA"
+  authors:
+    - family-names: Balzani
+      given-names: Riccardo
+  year: 2026
+  institution:
+    name: "University of Bologna"
+    address: "Bologna, Italy"
+  department: "Department of Computer Science and Engineering - DISI"
+  thesis-type: "Bachelor's thesis in Computer Science and Engineering"
